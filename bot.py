@@ -24,7 +24,8 @@ active_games = {}
 boss_battles = {}
 user_ids = {}
 scheduled_jobs = {}
-card_selections = {}
+game_messages = {}
+player_challenges = {}
 notification_settings = {}
 
 # --- ФУНКЦИЯ ЭКРАНИРОВАНИЯ HTML ---
@@ -45,8 +46,19 @@ def init_db():
         coins INTEGER DEFAULT 0,
         battles_today INTEGER DEFAULT 0,
         last_play_date TEXT,
-        is_test_mode INTEGER DEFAULT 0
+        is_test_mode INTEGER DEFAULT 0,
+        short_id INTEGER UNIQUE
     )''')
+    
+    # Добавляем колонку short_id если её нет
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN short_id INTEGER UNIQUE")
+        print("✅ Добавлена колонка short_id")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" in str(e).lower():
+            print("ℹ️ Колонка short_id уже существует")
+        else:
+            raise
     
     c.execute('''CREATE TABLE IF NOT EXISTS cards (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,6 +86,35 @@ def init_db():
         created_by INTEGER
     )''')
     
+    c.execute('''CREATE TABLE IF NOT EXISTS battle_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player1_id INTEGER,
+        player2_id INTEGER,
+        player1_wins INTEGER DEFAULT 0,
+        player2_wins INTEGER DEFAULT 0,
+        draws INTEGER DEFAULT 0,
+        last_battle_date TEXT,
+        UNIQUE(player1_id, player2_id)
+    )''')
+    
+    # Генерируем короткие ID для пользователей без них
+    c.execute("SELECT user_id FROM users WHERE short_id IS NULL")
+    users_without_id = c.fetchall()
+    
+    used_ids = set()
+    c.execute("SELECT short_id FROM users WHERE short_id IS NOT NULL")
+    for row in c.fetchall():
+        if row[0]:
+            used_ids.add(row[0])
+    
+    for (user_id,) in users_without_id:
+        for i in range(1, 100):
+            if i not in used_ids:
+                c.execute("UPDATE users SET short_id = ? WHERE user_id = ?", (i, user_id))
+                used_ids.add(i)
+                print(f"✅ Назначен ID {i} пользователю {user_id}")
+                break
+    
     c.execute("SELECT COUNT(*) FROM locations")
     if c.fetchone()[0] == 0:
         locations_data = [
@@ -87,28 +128,77 @@ def init_db():
             ('ВЕЛИКАЯ ПУСТОШЬ', 'В начале КАЖДОГО раунда карты получают 1 урон', None)
         ]
         c.executemany("INSERT INTO locations (name, description, file_id) VALUES (?, ?, ?)", locations_data)
+        print("✅ Добавлены локации по умолчанию")
     
     conn.commit()
     conn.close()
+    print("✅ База данных инициализирована")
+
+def get_short_id(user_id):
+    """Получает или генерирует короткий ID для пользователя"""
+    conn = sqlite3.connect('game_bot.db')
+    c = conn.cursor()
+    c.execute("SELECT short_id FROM users WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    
+    if result and result[0]:
+        conn.close()
+        return result[0]
+    
+    # Генерируем новый ID
+    c.execute("SELECT short_id FROM users WHERE short_id IS NOT NULL")
+    used_ids = set(row[0] for row in c.fetchall() if row[0])
+    
+    for i in range(1, 100):
+        if i not in used_ids:
+            c.execute("UPDATE users SET short_id = ? WHERE user_id = ?", (i, user_id))
+            conn.commit()
+            conn.close()
+            return i
+    
+    conn.close()
+    return 99
+
+def get_user_by_short_id(short_id):
+    """Находит пользователя по короткому ID"""
+    conn = sqlite3.connect('game_bot.db')
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE short_id = ?", (short_id,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else None
 
 def setup_bot_commands():
-    """Настройка команд ТОЛЬКО для ЛС (без /r и /s)"""
-    
-    private_commands = [
-        types.BotCommand('start', '🚀 Запустить бота'),
-        types.BotCommand('name', '👤 Установить прозвище'),
-        types.BotCommand('add', '🃏 Загрузить карту'),
-        types.BotCommand('my_cards', '📚 Мои карты'),
-        types.BotCommand('locations', '📍 Список локаций'),
-        types.BotCommand('delete', '🗑️ Удалить карту'),
-        types.BotCommand('surrender', '🏳️ Сдаться')
-    ]
-    
-    bot.set_my_commands(private_commands, types.BotCommandScopeDefault())
-    
-    print("✅ Команды для ЛС настроены!")
-    print("⚠️ /r и /s НЕ будут видны в ЛС")
-    print("⚠️ Для групп отправьте: /setup_group_commands")
+    """Настройка команд для бота"""
+    try:
+        # Команды для ГРУПП (появляются в меню группы)
+        group_commands = [
+            types.BotCommand('duel', '⚔️ Вызвать игрока на дуэль'),
+            types.BotCommand('list', '📋 Список всех игроков'),
+            types.BotCommand('r', '🎲 Бросить кубики'),
+            types.BotCommand('s', '🎮 Начать игру'),
+            types.BotCommand('locations', '📍 Список локаций')
+        ]
+        
+        # Команды для ЛС (появляются в меню ЛС)
+        private_commands = [
+            types.BotCommand('start', '🚀 Запустить бота'),
+            types.BotCommand('name', '👤 Установить прозвище'),
+            types.BotCommand('add', '🃏 Загрузить карту'),
+            types.BotCommand('my_cards', '📚 Мои карты'),
+            types.BotCommand('locations', '📍 Список локаций'),
+            types.BotCommand('delete', '🗑️ Удалить карту'),
+            types.BotCommand('surrender', '🏳️ Сдаться'),
+            types.BotCommand('stats', '📊 Моя статистика'),
+            types.BotCommand('get_id', '🆔 Узнать свой ID')
+        ]
+        
+        # Применяем команды по умолчанию (без scope - работает везде)
+        bot.set_my_commands(group_commands)
+        bot.set_my_commands(private_commands, types.BotCommandScopeDefault())
+        print("✅ Команды меню настроены")
+    except Exception as e:
+        print(f"⚠️ Ошибка настройки команд: {e}")
 
 def get_user(user_id):
     conn = sqlite3.connect('game_bot.db')
@@ -118,7 +208,7 @@ def get_user(user_id):
     if not user:
         c.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
         conn.commit()
-        user = (user_id, None, None, 0, 0, None, 0)
+        user = (user_id, None, None, 0, 0, None, 0, None)
     conn.close()
     return user
 
@@ -137,14 +227,6 @@ def get_user_cards(user_id):
     cards = c.fetchall()
     conn.close()
     return cards
-
-def get_card_by_id(card_id, user_id):
-    conn = sqlite3.connect('game_bot.db')
-    c = conn.cursor()
-    c.execute("SELECT id, file_id, card_name FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id))
-    card = c.fetchone()
-    conn.close()
-    return card
 
 def add_card(user_id, file_id, card_name):
     conn = sqlite3.connect('game_bot.db')
@@ -184,7 +266,7 @@ def check_limits(user_id):
         return True, limit - user[4]
     return False, 0
 
-def update_user_stats(user_id, coins_change, battle_played):
+def update_user_stats(user_id, coins_change, battle_played, opponent_id=None, won=False, draw=False):
     user = get_user(user_id)
     today = datetime.date.today().isoformat()
     
@@ -203,7 +285,97 @@ def update_user_stats(user_id, coins_change, battle_played):
     update_user(user_id, coins=new_coins, 
                 battles_today=current_battles, last_play_date=today)
     
+    if opponent_id and battle_played:
+        update_battle_stats(user_id, opponent_id, won, draw)
+    
     return new_coins, current_battles
+
+def update_battle_stats(player1_id, player2_id, player1_won, draw):
+    conn = sqlite3.connect('game_bot.db')
+    c = conn.cursor()
+    
+    c.execute("SELECT * FROM battle_stats WHERE (player1_id = ? AND player2_id = ?) OR (player1_id = ? AND player2_id = ?)",
+              (player1_id, player2_id, player2_id, player1_id))
+    record = c.fetchone()
+    
+    today = datetime.date.today().isoformat()
+    
+    if record:
+        if draw:
+            c.execute("UPDATE battle_stats SET draws = draws + 1, last_battle_date = ? WHERE id = ?",
+                      (today, record[0]))
+        elif player1_won:
+            c.execute("UPDATE battle_stats SET player1_wins = player1_wins + 1, last_battle_date = ? WHERE id = ?",
+                      (today, record[0]))
+        else:
+            c.execute("UPDATE battle_stats SET player2_wins = player2_wins + 1, last_battle_date = ? WHERE id = ?",
+                      (today, record[0]))
+    else:
+        if draw:
+            c.execute("INSERT INTO battle_stats (player1_id, player2_id, draws, last_battle_date) VALUES (?, ?, 1, ?)",
+                      (player1_id, player2_id, today))
+        elif player1_won:
+            c.execute("INSERT INTO battle_stats (player1_id, player2_id, player1_wins, last_battle_date) VALUES (?, ?, 1, ?)",
+                      (player1_id, player2_id, today))
+        else:
+            c.execute("INSERT INTO battle_stats (player1_id, player2_id, player2_wins, last_battle_date) VALUES (?, ?, 1, ?)",
+                      (player1_id, player2_id, today))
+    
+    conn.commit()
+    conn.close()
+
+def get_battle_stats(player_id):
+    conn = sqlite3.connect('game_bot.db')
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT 
+            CASE 
+                WHEN player1_id = ? THEN player2_id 
+                ELSE player1_id 
+            END as opponent_id,
+            CASE 
+                WHEN player1_id = ? THEN player1_wins 
+                ELSE player2_wins 
+            END as my_wins,
+            CASE 
+                WHEN player1_id = ? THEN player2_wins 
+                ELSE player1_wins 
+            END as opponent_wins,
+            draws
+        FROM battle_stats 
+        WHERE player1_id = ? OR player2_id = ?
+    """, (player_id, player_id, player_id, player_id, player_id))
+    
+    stats = c.fetchall()
+    conn.close()
+    return stats
+
+def get_all_players():
+    """Получает список всех игроков с их статистикой"""
+    conn = sqlite3.connect('game_bot.db')
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT 
+            u.user_id,
+            u.short_id,
+            u.nickname,
+            u.username,
+            u.coins,
+            COALESCE(SUM(bs.player1_wins), 0) + COALESCE(SUM(bs.player2_wins), 0) as total_wins,
+            COALESCE(SUM(CASE WHEN bs.player1_id = u.user_id THEN bs.player2_wins ELSE bs.player1_wins END), 0) as total_losses,
+            COALESCE(SUM(bs.draws), 0) as total_draws
+        FROM users u
+        LEFT JOIN battle_stats bs ON u.user_id = bs.player1_id OR u.user_id = bs.player2_id
+        WHERE u.short_id IS NOT NULL
+        GROUP BY u.user_id
+        ORDER BY u.short_id
+    """)
+    
+    players = c.fetchall()
+    conn.close()
+    return players
 
 def is_monday():
     return datetime.datetime.today().weekday() == 0
@@ -215,11 +387,12 @@ def is_sunday():
     return datetime.datetime.today().weekday() == 6
 # --- ОБРАБОТЧИКИ КОМАНД ---
 
-@bot.message_handler(commands=['start', 'get_id'])
+@bot.message_handler(commands=['start'])
 def send_welcome(message):
     global ORGANIZER_ID
     user_id = message.from_user.id
     username = message.from_user.username
+    short_id = get_short_id(user_id)
     
     if username:
         user_ids[username] = user_id
@@ -236,6 +409,7 @@ def send_welcome(message):
     nickname = escape_html(user[2] if user[2] else 'Не установлено')
     
     text = (f"🎮 <b>Привет, {first_name}!</b>\n\n"
+            f"🆔 <b>Ваш ID:</b> <code>{short_id}</code>\n"
             f"💰 Монеты: {user[3]}\n"
             f"⚔️ Боёв сегодня: {user[4]}/7 (14 в субботу)\n"
             f"👤 Прозвище: {nickname}\n\n"
@@ -243,31 +417,70 @@ def send_welcome(message):
             f"🔹 /stats — Моя статистика\n"
             f"🔹 /name — Установить прозвище\n"
             f"🔹 /add — Загрузить карту (ответьте на фото)\n"
-            f"🔹 /my_cards — Моя колода (с картинками)\n"
+            f"🔹 /my_cards — Моя колода\n"
             f"🔹 /delete — Удалить карту\n"
             f"🔹 /surrender — Сдаться в бою\n"
-            f"🔹 /locations — Список локаций")
+            f"🔹 /locations — Список локаций\n"
+            f"🔹 /get_id — Узнать свой ID")
+    
+    bot.reply_to(message, text, parse_mode="HTML")
+
+@bot.message_handler(commands=['get_id'])
+def get_id(message):
+    """Показывает ID пользователя"""
+    user_id = message.from_user.id
+    short_id = get_short_id(user_id)
+    username = message.from_user.username or "Нет"
+    first_name = escape_html(message.from_user.first_name)
+    nickname = get_user(user_id)[2] or "Не установлено"
+    
+    text = (f"👤 <b>Ваша информация:</b>\n\n"
+            f"🆔 <b>Короткий ID:</b> <code>{short_id}</code>\n"
+            f"🔢 <b>Telegram ID:</b> <code>{user_id}</code>\n"
+            f"📛 Username: @{escape_html(username)}\n"
+            f"🏷️ Имя: {first_name}\n"
+            f"🎭 Прозвище: {escape_html(nickname)}\n\n"
+            f"💡 <b>Как использовать:</b>\n"
+            f"• Для вызова: /duel {short_id}\n"
+            f"• Для статистики: /stats_user {user_id}")
     
     bot.reply_to(message, text, parse_mode="HTML")
 
 @bot.message_handler(commands=['stats'])
 def show_stats(message):
-    user = get_user(message.from_user.id)
+    user_id = message.from_user.id
+    user = get_user(user_id)
     today = datetime.date.today()
     limit = 14 if today.weekday() == 5 else 7
     battles = user[4] if user[5] == today.isoformat() else 0
+    short_id = get_short_id(user_id)
     
     nickname = escape_html(user[2] if user[2] else 'Не установлено')
     
+    battle_stats = get_battle_stats(user_id)
+    
     text = (f"📊 <b>Статистика</b>\n"
+            f"🆔 ID: <code>{short_id}</code>\n"
             f"💰 Монеты: {user[3]}\n"
             f"⚔️ Боёв сегодня: {battles}/{limit}\n"
             f"📅 Осталось боев: {limit - battles}\n"
-            f"👤 Прозвище: {nickname}")
+            f"👤 Прозвище: {nickname}\n\n")
+    
+    if battle_stats:
+        text += f"<b>📈 Статистика боёв:</b>\n\n"
+        for opponent_id, my_wins, opponent_wins, draws in battle_stats:
+            opponent = get_user(opponent_id)
+            opponent_short = get_short_id(opponent_id)
+            opponent_nick = escape_html(opponent[2] if opponent[2] else f"Игрок {opponent_short}")
+            text += f"🆚 {opponent_nick} (ID:{opponent_short}): {my_wins} побед / {opponent_wins} поражений / {draws} ничьих\n"
+    else:
+        text += f"📈 Статистика боёв: Пока нет сыгранных матчей"
+    
     bot.reply_to(message, text, parse_mode="HTML")
 
 @bot.message_handler(commands=['stats_user'])
 def stats_user(message):
+    """Статистика другого игрока (только для организатора)"""
     global ORGANIZER_ID
     user_id = message.from_user.id
     
@@ -285,9 +498,11 @@ def stats_user(message):
         
         nickname = escape_html(target[2] if target[2] else 'Не установлено')
         username = escape_html(target[1] if target[1] else 'Нет')
+        short_id = get_short_id(target_id)
         
         text = (f"📊 <b>Статистика игрока</b>\n\n"
-                f"👤 ID: <code>{target_id}</code>\n"
+                f"🆔 Короткий ID: <code>{short_id}</code>\n"
+                f"🔢 Telegram ID: <code>{target_id}</code>\n"
                 f"📛 Username: @{username}\n"
                 f"🏷️ Прозвище: {nickname}\n"
                 f"💰 Монеты: {target[3]}\n"
@@ -299,7 +514,8 @@ def stats_user(message):
         bot.reply_to(message, "Использование: /stats_user <user_id>")
 
 @bot.message_handler(commands=['name'])
-def set_nickname_short(message):
+def set_nickname(message):
+    """Установить прозвище"""
     try:
         nickname = message.text.split(' ', 1)[1].strip()
         if len(nickname) > 20:
@@ -311,7 +527,8 @@ def set_nickname_short(message):
         bot.reply_to(message, "Использование: /name <прозвище>")
 
 @bot.message_handler(commands=['add'])
-def upload_card_short(message):
+def upload_card(message):
+    """Загрузить карту"""
     if not message.reply_to_message or not message.reply_to_message.photo:
         bot.reply_to(message, "Ответьте на фото карты этой командой")
         return
@@ -328,6 +545,7 @@ def upload_card_short(message):
 
 @bot.message_handler(commands=['my_cards'])
 def my_cards(message):
+    """Показать свои карты"""
     user_id = message.from_user.id
     cards = get_user_cards(user_id)
     
@@ -336,9 +554,12 @@ def my_cards(message):
         return
     
     for idx, (card_id, file_id, name) in enumerate(cards, 1):
+        is_support = name.lower().endswith('поддержка')
         caption = f"🃏 <b>Карта #{idx}</b>\n"
         caption += f"ID: <code>{card_id}</code>\n"
-        caption += f"Название: {escape_html(name)}"
+        caption += f"Название: {escape_html(name)}\n"
+        if is_support:
+            caption += f"✨ <b>Поддержка</b> (можно несколько в одном ходе)"
         
         bot.send_photo(user_id, file_id, caption=caption, parse_mode="HTML")
     
@@ -349,11 +570,12 @@ def my_cards(message):
         f"2️⃣ Поставьте двоеточие\n"
         f"3️⃣ Напишите способности через запятую\n\n"
         f"<b>Пример:</b> <code>1,2,3: 2,0,1</code>\n"
-        f"Бот автоматически отправит картинки карт!", 
+        f"⚠️ <b>Важно:</b> Более 1 карты можно только если у всех есть 'поддержка' в конце названия!", 
         parse_mode="HTML")
 
 @bot.message_handler(commands=['delete'])
-def delete_card_short(message):
+def delete_card_cmd(message):
+    """Удалить карту"""
     try:
         card_id = int(message.text.split()[1])
         card = delete_card(card_id, message.from_user.id)
@@ -372,6 +594,7 @@ def delete_card_short(message):
 
 @bot.message_handler(commands=['surrender'])
 def surrender(message):
+    """Сдаться в бою"""
     user_id = message.from_user.id
     for chat_id, game in list(active_games.items()):
         if user_id in [game.get('p1'), game.get('p2')]:
@@ -381,9 +604,10 @@ def surrender(message):
             
             winner_id = game['p2'] if user_id == game['p1'] else game['p1']
             winner_nick = game['nickname_p2'] if user_id == game['p1'] else game['nickname_p1']
+            opponent_id = game['p2'] if user_id == game['p1'] else game['p1']
             
-            w_total, w_rem = update_user_stats(winner_id, 3, True)
-            l_total, l_rem = update_user_stats(user_id, 0, True)
+            w_total, w_rem = update_user_stats(winner_id, 3, True, opponent_id, won=True)
+            l_total, l_rem = update_user_stats(user_id, 0, True, opponent_id, won=False)
             
             today = datetime.date.today()
             limit = 14 if today.weekday() == 5 else 7
@@ -399,6 +623,7 @@ def surrender(message):
 
 @bot.message_handler(commands=['locations'])
 def show_locations(message):
+    """Показать список локаций"""
     locations = get_locations()
     if not locations:
         bot.reply_to(message, "Локации не загружены")
@@ -410,8 +635,151 @@ def show_locations(message):
     
     bot.reply_to(message, text, parse_mode="HTML")
 
+@bot.message_handler(commands=['duel'])
+def duel_player(message):
+    """Вызов игрока на дуэль по короткому ID"""
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    
+    if message.chat.type == 'private':
+        bot.reply_to(message, "⚠️ Эта команда работает только в группах!")
+        return
+    
+    try:
+        target_short_id = int(message.text.split()[1])
+        
+        if target_short_id < 1 or target_short_id > 99:
+            bot.reply_to(message, "❌ ID должен быть от 1 до 99!")
+            return
+        
+        target_id = get_user_by_short_id(target_short_id)
+        
+        if not target_id:
+            bot.reply_to(message, f"❌ Игрок с ID {target_short_id} не найден!")
+            return
+        
+        if target_id == user_id:
+            bot.reply_to(message, "❌ Нельзя вызвать самого себя!")
+            return
+        
+        can_play, remaining = check_limits(user_id)
+        if not can_play:
+            bot.reply_to(message, "Лимит боев исчерпан!")
+            return
+        
+        challenger_short = get_short_id(user_id)
+        target_short = get_short_id(target_id)
+        
+        player_challenges[chat_id] = {
+            'challenger': user_id,
+            'challenger_nick': get_user(user_id)[2] or f"Игрок {challenger_short}",
+            'challenger_short': challenger_short,
+            'target': target_id,
+            'target_nick': get_user(target_id)[2] or f"Игрок {target_short}",
+            'target_short': target_short,
+            'created': datetime.datetime.now()
+        }
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("✅ Принять вызов", callback_data="accept_duel"))
+        markup.add(types.InlineKeyboardButton("❌ Отклонить", callback_data="decline_duel"))
+        
+        bot.send_message(chat_id, 
+            f"⚔️ <b>ВЫЗОВ НА ДУЭЛЬ!</b>\n\n"
+            f"🎮 {escape_html(player_challenges[chat_id]['challenger_nick'])} (ID:{challenger_short})\n"
+            f"⚔️ вызывает\n"
+            f"🎮 {escape_html(player_challenges[chat_id]['target_nick'])} (ID:{target_short})\n\n"
+            f"@{get_user(target_id)[1] if get_user(target_id)[1] else 'игрок'}, примите вызов!", 
+            reply_markup=markup, parse_mode="HTML")
+        
+        scheduler.add_job(
+            lambda: cleanup_challenge(chat_id),
+            DateTrigger(run_date=datetime.datetime.now() + datetime.timedelta(minutes=5)),
+            id=f'duel_{chat_id}'
+        )
+        
+    except (IndexError, ValueError):
+        bot.reply_to(message, 
+            "Использование: /duel <ID_игрока>\n\n"
+            "Чтобы узнать ID игрока:\n"
+            "• /list — показать всех игроков\n"
+            "• Игрок может узнать свой ID через /start или /get_id")
+
+def cleanup_challenge(chat_id):
+    """Удаляет истёкший вызов"""
+    if chat_id in player_challenges:
+        bot.send_message(chat_id, "⏰ Вызов истёк (не был принят за 5 минут)")
+        del player_challenges[chat_id]
+
+@bot.message_handler(commands=['list'])
+def list_players(message):
+    """Показывает список всех игроков"""
+    if message.chat.type == 'private':
+        bot.reply_to(message, "⚠️ Эта команда работает только в группах!")
+        return
+    
+    players = get_all_players()
+    
+    if not players:
+        bot.reply_to(message, "📋 Пока нет зарегистрированных игроков!")
+        return
+    
+    text = f"📋 <b>Список игроков ({len(players)}):</b>\n\n"
+    
+    for player in players:
+        user_id, short_id, nickname, username, coins, wins, losses, draws = player
+        nick = escape_html(nickname if nickname else f"Игрок {short_id}")
+        total_battles = wins + losses + draws
+        
+        text += f"🆔 <b>ID:{short_id}</b> — {nick}\n"
+        text += f"   💰 {coins} | ⚔️ {wins}П / {losses}П / {draws}Н | Всего: {total_battles}\n\n"
+    
+    bot.reply_to(message, text, parse_mode="HTML")
+
+@bot.message_handler(commands=['all_commands'])
+def all_commands(message):
+    """Показывает ВСЕ команды включая скрытые"""
+    username = message.from_user.username
+    user_id = message.from_user.id
+    
+    # Доступно только организатору и тестировщику
+    if username not in ['angel_zam', ORGANIZER_USERNAME]:
+        bot.reply_to(message, "❌ Доступ запрещён")
+        return
+    
+    text = (f"🛠️ <b>ВСЕ КОМАНДЫ БОТА</b>\n\n"
+            f"<b>📱 Основные (в меню):</b>\n"
+            f"/start — Запустить бота\n"
+            f"/name — Установить прозвище\n"
+            f"/add — Загрузить карту\n"
+            f"/my_cards — Мои карты\n"
+            f"/delete — Удалить карту\n"
+            f"/surrender — Сдаться\n"
+            f"/stats — Статистика\n"
+            f"/duel — Вызвать игрока\n"
+            f"/list — Список игроков\n"
+            f"/r — Бросить кубики\n"
+            f"/locations — Локации\n"
+            f"/get_id — Узнать ID\n"
+            f"/s — Быстрый старт игры\n\n"
+            f"<b>🔧 Для организатора:</b>\n"
+            f"/stats_user (id) — Статистика игрока\n"
+            f"/boss_reward (id) (монеты) — Награда от босса\n"
+            f"/boss_time (часы) (минуты) — Время боя с боссом\n"
+            f"/upload_location | Name | Desc — Загрузить локацию\n"
+            f"/schedule_message — Запланировать сообщение\n"
+            f"/notifications — Настройка уведомлений\n\n"
+            f"<b>🧪 Для тестировщика:</b>\n"
+            f"/test_mode — Режим теста\n"
+            f"/dev_commands — Команды разработчика\n"
+            f"/add_coins — Добавить монеты\n"
+            f"/reset_battles — Сбросить бои")
+    
+    bot.reply_to(message, text, parse_mode="HTML")
+
 @bot.message_handler(commands=['notifications'])
 def notifications_settings(message):
+    """Настройка уведомлений для организатора и тестировщика"""
     username = message.from_user.username
     user_id = message.from_user.id
     
@@ -458,6 +826,7 @@ def toggle_notifications(call):
 
 @bot.message_handler(commands=['create_game'])
 def create_game(message):
+    """Создание игры через меню"""
     if message.chat.type == 'private':
         return
 
@@ -491,8 +860,7 @@ def create_game(message):
         'location': None,
         'location_name': None,
         'mode': '1v1',
-        'consent': {},
-        'draw_consent': {}
+        'consent': {}
     }
     
     markup = types.InlineKeyboardMarkup()
@@ -502,63 +870,26 @@ def create_game(message):
     if allow_2v2:
         markup.add(types.InlineKeyboardButton("Режим 2x2", callback_data="mode_2v2"))
     
-    # Кнопка локации скрыта пока не выбраны оба игрока
+    markup.add(types.InlineKeyboardButton("▶️ Настроить локацию", callback_data="location_setup"))
     
     bot.send_message(chat_id, 
         f"🎮 <b>Игра создана!</b>\n"
         f"Ведущий: {escape_html(active_games[chat_id]['host_nickname'])}\n\n"
         f"<b>Настройки:</b>\n"
-        f"• Нужны 2 РАЗНЫХ игрока для начала\n"
+        f"• Ведущий может быть отдельным или стать Игроком 1\n"
+        f"• Нужны 2 игрока для начала\n"
         f"• Можно выбрать локацию или играть без неё\n"
+        f"• Можно отправлять несколько карт (только 'поддержка')\n"
         f"• Формат: <code>1,2,3: 2,0,1</code> (номера карт: способности)\n"
-        f"• Бот автоматически отправит картинки карт из колоды\n\n"
+        f"• Бот автоматически отправит картинки карт из колоды\n"
+        f"• ⏰ На отправку карт даётся 2 минуты\n\n"
         f"Нажмите кнопку чтобы стать игроком:", 
         reply_markup=markup, parse_mode="HTML")
 
-    """Обновляет кнопку локации - показывает только если оба игрока выбраны"""
-    
-    if game['p1'] is not None and game['p2'] is not None:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("▶️ Настроить локацию", callback_data="location_setup"))
-        bot.send_message(chat_id, 
-            "✅ **Оба игрока выбраны!**\n\nВедущий может настроить локацию:", 
-            reply_markup=markup, parse_mode="HTML")
-
-@bot.message_handler(commands=['setup_group_commands'])
-def setup_group_commands(message):
-    """Настройка команд для конкретной группы"""
-    
-    if message.chat.type in ['group', 'supergroup']:
-        group_commands = [
-            types.BotCommand('r', '🎲 Бросить кубики'),
-            types.BotCommand('s', '🎮 Создать игру'),
-            types.BotCommand('locations', '📍 Список локаций')
-        ]
-        
-        bot.set_my_commands(group_commands, types.BotCommandScopeChat(message.chat.id))
-        
-        bot.reply_to(message, 
-            "✅ **Команды для этой группы настроены!**\n\n"
-            "📋 Теперь в этой группе видны:\n"
-            "/r - 🎲 Бросить кубики\n"
-            "/s - 🎮 Создать игру\n"
-            "/locations - 📍 Список локаций\n\n"
-            "⚠️ В ЛС эти команды не видны!", 
-            parse_mode="Markdown")
-    else:
-        bot.reply_to(message, 
-            "⚠️ Эта команда работает **только в группах**!", 
-            parse_mode="Markdown")
-
-# --- КОРОТКИЕ КОМАНДЫ ДЛЯ ГРУППЫ ---
-
 @bot.message_handler(commands=['r'])
 def roll_short(message):
+    """Короткая версия /roll"""
     if message.chat.type == 'private':
-        bot.reply_to(message, 
-            "⚠️ Команда `/r` работает **только в группах**!\n\n"
-            "В ЛС используйте: /start, /name, /add, /my_cards, /delete, /surrender", 
-            parse_mode="Markdown")
         return
     
     try:
@@ -581,18 +912,16 @@ def roll_short(message):
 
 @bot.message_handler(commands=['s'])
 def start_game_short(message):
+    """Быстрый старт игры со случайной локацией"""
     if message.chat.type == 'private':
-        bot.reply_to(message, 
-            "⚠️ Команда `/s` работает **только в группах**!\n\n"
-            "В ЛС используйте: /start, /name, /add, /my_cards, /delete, /surrender", 
-            parse_mode="Markdown")
+        bot.reply_to(message, "⚠️ Только в группах!")
         return
     
     chat_id = message.chat.id
     user_id = message.from_user.id
     
     if chat_id in active_games:
-        bot.reply_to(message, "⚠️ В этом чате уже идет игра!")
+        bot.reply_to(message, "Игра уже идет!")
         return
     
     can_play, remaining = check_limits(user_id)
@@ -600,11 +929,12 @@ def start_game_short(message):
         bot.reply_to(message, "Лимит боев исчерпан!")
         return
     
+    # Автоматически создаем игру с пользователем как Игрок 1
     active_games[chat_id] = {
         'host': user_id,
         'host_nickname': get_user(user_id)[2] or message.from_user.first_name,
-        'p1': None,
-        'nickname_p1': None,
+        'p1': user_id,
+        'nickname_p1': get_user(user_id)[2] or message.from_user.first_name,
         'p2': None,
         'nickname_p2': None,
         'score_p1': 0,
@@ -614,27 +944,70 @@ def start_game_short(message):
         'cards_submitted_p1': False,
         'cards_submitted_p2': False,
         'location': None,
-        'location_name': None,
-        'mode': '1v1',
-        'consent': {},
-        'draw_consent': {}
+        'location_name': None
     }
     
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🎮 Я буду Игроком 1", callback_data="become_p1"))
-    markup.add(types.InlineKeyboardButton("Я второй игрок", callback_data="join_p2"))
-    
-    if is_monday():
-        markup.add(types.InlineKeyboardButton("Режим 2x2", callback_data="mode_2v2"))
-    
+    # Случайная локация
+    locations = get_locations()
+    if locations:
+        selected_loc = random.choice(locations)
+        active_games[chat_id]['location'] = selected_loc[3]
+        active_games[chat_id]['location_name'] = selected_loc[1]
+        
+        if selected_loc[3]:
+            bot.send_photo(chat_id, selected_loc[3], 
+                          caption=f"🎲 <b>Локация: {escape_html(selected_loc[1])}</b>\n{escape_html(selected_loc[2])}", 
+                          parse_mode="HTML")
+        else:
+            bot.send_message(chat_id, 
+                            f"🎲 <b>Локация: {escape_html(selected_loc[1])}</b>\n{escape_html(selected_loc[2])}", 
+                            parse_mode="HTML")
+    else:
+        active_games[chat_id]['location_name'] = "Без локации"
+        bot.send_message(chat_id, "🚫 <b>Без локации</b>", parse_mode="HTML")
     
     bot.send_message(chat_id, 
-        f"🎮 <b>Игра создана!</b>\n"
-        f"Ведущий: {escape_html(active_games[chat_id]['host_nickname'])}\n\n"
-        f"Нажмите кнопку чтобы стать игроком:", 
-        reply_markup=markup, parse_mode="HTML")
+        f"🎮 <b>ИГРА НАЧАЛАСЬ!</b>\n\n"
+        f"👥 {escape_html(active_games[chat_id]['nickname_p1'])} vs ???\n"
+        f"📍 Локация: {escape_html(active_games[chat_id]['location_name'])}\n\n"
+        f"Второй игрок, напишите /join чтобы присоединиться!", 
+        parse_mode="HTML")
 
-# --- ЛОГИКА ИГРЫ ---
+@bot.message_handler(commands=['join'])
+def join_game_cmd(message):
+    """Команда для второго игрока чтобы присоединиться"""
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    
+    if chat_id not in active_games:
+        bot.reply_to(message, "Нет активной игры!")
+        return
+    
+    game = active_games[chat_id]
+    
+    if game['p2'] is not None:
+        bot.reply_to(message, "Место уже занято!")
+        return
+    
+    if user_id == game['p1']:
+        bot.reply_to(message, "Вы уже Игрок 1!")
+        return
+    
+    game['p2'] = user_id
+    game['nickname_p2'] = get_user(user_id)[2] or message.from_user.first_name
+    
+    bot.reply_to(message, f"✅ Вы присоединились как Игрок 2!")
+    
+    bot.send_message(chat_id, 
+        f"🎮 <b>ИГРА НАЧАЛАСЬ!</b>\n\n"
+        f"👥 {escape_html(game['nickname_p1'])} vs {escape_html(game['nickname_p2'])}\n"
+        f"📍 Локация: {escape_html(game['location_name'])}\n\n"
+        f"📩 Напишите в ЛС боту: <code>1,2: 2,0</code>", 
+        parse_mode="HTML")
+    
+    start_round(chat_id, game)
+
+# --- ОБРАБОТЧИКИ КНОПОК ---
 
 @bot.callback_query_handler(func=lambda call: call.data == "become_p1")
 def become_p1(call):
@@ -644,38 +1017,25 @@ def become_p1(call):
     
     game = active_games[chat_id]
     
-    # Проверка: игрок не может быть обоими игроками одновременно
-    if call.from_user.id == game['p2']:
-        bot.answer_callback_query(call.id, "❌ Вы уже Игрок 2! Нельзя быть обоими игроками!", show_alert=True)
-        return
-    
     if game['p1'] is None:
-        game['p1'] = call.from_user.id
-        game['nickname_p1'] = get_user(call.from_user.id)[2] or call.from_user.first_name
+        game['p1'] = game['host']
+        game['nickname_p1'] = game['host_nickname']
         game['consent'][game['p1']] = True
         bot.answer_callback_query(call.id, "Вы стали Игроком 1!")
-        bot.send_message(chat_id, f"✅ {escape_html(game['nickname_p1'])} стал Игроком 1!")
-        
-  # Кнопка локации будет показана когда оба игрока выбраны
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("Я второй игрок", callback_data="join_p2"))
-        if is_monday():
-            markup.add(types.InlineKeyboardButton("Режим 2x2", callback_data="mode_2v2"))
-        bot.edit_message_reply_markup(chat_id=chat_id, message_id=call.message.message_id, reply_markup=markup)
+        bot.send_message(chat_id, f"✅ {escape_html(game['host_nickname'])} стал Игроком 1!")
     else:
         bot.answer_callback_query(call.id, "Место Игрока 1 уже занято!", show_alert=True)
 
 @bot.callback_query_handler(func=lambda call: call.data == "join_p2")
-def join_game(call):
+def join_p2(call):
     chat_id = call.message.chat.id
     if chat_id not in active_games:
         return
     
     game = active_games[chat_id]
     
-    # Проверка: игрок не может быть обоими игроками одновременно
     if call.from_user.id == game['p1']:
-        bot.answer_callback_query(call.id, "❌ Вы уже Игрок 1! Нельзя быть обоими игроками!", show_alert=True)
+        bot.answer_callback_query(call.id, "Вы уже Игрок 1!", show_alert=True)
         return
 
     if game['p2'] is None:
@@ -686,13 +1046,11 @@ def join_game(call):
         bot.answer_callback_query(call.id, "Вы присоединились!")
         bot.send_message(chat_id, 
             f"Игрок 2: {escape_html(game['nickname_p2'])} присоединился!\n\n"
-            f"Теперь можно выбрать локацию!", 
+            f"Теперь нужно выбрать локацию!", 
             parse_mode="HTML")
         
-        # Обновляем кнопку локации - теперь доступна
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("▶️ Настроить локацию", callback_data="location_setup"))
-        bot.send_message(chat_id, "✅ Оба игрока выбраны! Ведущий может настроить локацию:", reply_markup=markup)
+        # Автоматически продолжаем к выбору локации
+        check_and_start_game(chat_id, game)
     else:
         bot.answer_callback_query(call.id, "Место занято!", show_alert=True)
 
@@ -714,11 +1072,6 @@ def location_setup(call):
     
     if call.from_user.id != game['host']:
         bot.answer_callback_query(call.id, "Только ведущий!", show_alert=True)
-        return
-    
-    # Проверка: оба игрока должны быть выбраны
-    if game['p1'] is None or game['p2'] is None:
-        bot.answer_callback_query(call.id, "Сначала нужны 2 игрока!", show_alert=True)
         return
     
     markup = types.InlineKeyboardMarkup()
@@ -838,20 +1191,31 @@ def loc_chosen(call):
     bot.answer_callback_query(call.id, f"Выбрана: {game['location_name']}")
 
 def check_and_start_game(chat_id, game):
-    if game['p1'] is None or game['p2'] is None:
+    """Проверяет готовность и начинает игру"""
+    if game['p1'] is None:
         bot.send_message(chat_id, 
             f"✅ Локация выбрана: {escape_html(game['location_name'])}\n\n"
-            f"⏳ Ждем игроков...", 
+            f"⏳ Ждем Игрока 1...", 
             parse_mode="HTML")
         return
     
+    if game['p2'] is None:
+        bot.send_message(chat_id, 
+            f"✅ Локация выбрана: {escape_html(game['location_name'])}\n\n"
+            f"⏳ Ждем Игрока 2...", 
+            parse_mode="HTML")
+        return
+    
+    # Оба игрока есть и локация выбрана
     bot.send_message(chat_id, 
         f"🎮 <b>ИГРА НАЧАЛАСЬ!</b>\n\n"
         f"👥 {escape_html(game['nickname_p1'])} vs {escape_html(game['nickname_p2'])}\n"
         f"📍 Локация: {escape_html(game['location_name'])}\n\n"
         f"📩 Игроки, напишите в <b>ЛИЧНЫЕ СООБЩЕНИЯ</b> боту:\n"
-        f"<code>1,2,3: 2,0,1</code>\n\n"
-        f"⚠️ <b>Фото отправлять не нужно!</b>", 
+        f"<code>1,2,3: 2,0,1</code>\n"
+        f"(номера карт из вашей колоды : способности)\n\n"
+        f"⚠️ <b>Фото отправлять не нужно!</b>\n"
+        f"Бот автоматически возьмёт картинки из вашей колоды", 
         parse_mode="HTML")
     
     start_round(chat_id, game)
@@ -860,12 +1224,6 @@ def start_round(chat_id, game):
     game['cards'] = {'p1': [], 'p2': []}
     game['cards_submitted_p1'] = False
     game['cards_submitted_p2'] = False
-    game['draw_consent'] = {}  # Сброс голосования за ничью
-    
-    if game['p1'] in card_selections:
-        del card_selections[game['p1']]
-    if game['p2'] in card_selections:
-        del card_selections[game['p2']]
     
     if is_friday():
         bot.send_message(chat_id, "🔄 <b>ПЯТНИЦА!</b> Сегодня вы используете карты соперников!", parse_mode="HTML")
@@ -881,11 +1239,6 @@ def start_round(chat_id, game):
 def handle_card_submission(message):
     user_id = message.from_user.id
     
-    # ❌ ИГНОРИРУЕМ СООБЩЕНИЯ В ГРУППАХ - карты только в ЛС
-    if message.chat.type != 'private':
-        return
-    
-    # Ищем активную игру этого игрока
     found_chat = None
     found_game = None
     for chat_id, game in active_games.items():
@@ -897,33 +1250,31 @@ def handle_card_submission(message):
     if not found_chat or not found_game:
         return
     
-    game = found_game
+    game = active_games[found_chat]
+    
     is_p1 = user_id == game['p1']
     is_p2 = user_id == game['p2']
     
     if not is_p1 and not is_p2:
         return
     
-    # ✅ Проверяем отправил ли уже карты
-    # Если ДРУГОЙ игрок ещё не отправил - можно изменить карты
     if is_p1 and game['cards_submitted_p1']:
-        if game['cards_submitted_p2']:
-            # Оба отправили - раунд начался, нельзя менять
-            return
-        # Другой ещё не отправил - можно изменить (тихо перезаписываем)
+        bot.reply_to(message, "⚠️ Вы уже отправили карты в этом раунде!")
+        return
     if is_p2 and game['cards_submitted_p2']:
-        if game['cards_submitted_p1']:
-            # Оба отправили - раунд начался, нельзя менять
-            return
-        # Другой ещё не отправил - можно изменить (тихо перезаписываем)
+        bot.reply_to(message, "⚠️ Вы уже отправили карты в этом раунде!")
+        return
     
     text = message.text.strip()
     
+    # Проверяем формат "1,2,3: 2,0,1" или "1,2,3: 2 +5 атака, 0, 1 защита"
     if ':' not in text:
         bot.reply_to(message, 
             "❌ Неверный формат!\n\n"
-            "<b>Правильный формат:</b> <code>1,2,3: 2,0,1</code>\n\n"
-            "Пример: <code>1,2: 2 +5 атака, 0</code>", 
+            "<b>Правильный формат:</b> <code>1,2,3: 2,0,1</code>\n"
+            "(номера карт : способности через запятую)\n\n"
+            "Пример: <code>1,2: 2 +5 атака, 0</code>\n"
+            "(Карта 1 с способностью 2 +5 атака, Карта 2 с способностью 0)", 
             parse_mode="HTML")
         return
     
@@ -932,25 +1283,60 @@ def handle_card_submission(message):
         card_nums_str = parts[0].strip()
         abilities_str = parts[1].strip() if len(parts) > 1 else ""
         
+        # Парсим номера карт
         card_nums = [int(x.strip()) for x in card_nums_str.split(',') if x.strip().isdigit()]
         
         if not card_nums:
             bot.reply_to(message, "❌ Укажите хотя бы одну карту!")
             return
         
+        # ПРОВЕРКА: более 1 карты только если есть "поддержка" в конце названия
+        if len(card_nums) > 1:
+            user_cards = get_user_cards(user_id)
+            if is_friday():
+                opponent_id = game['p2'] if is_p1 else game['p1']
+                if opponent_id:
+                    user_cards = get_user_cards(opponent_id)
+            
+            all_support = True
+            for card_num in card_nums:
+                card_found = False
+                for cid, c_file_id, c_name in user_cards:
+                    if cid == card_num:
+                        card_found = True
+                        if not c_name.lower().endswith('поддержка'):
+                            all_support = False
+                        break
+                if not card_found:
+                    bot.reply_to(message, f"❌ Карта #{card_num} не найдена в вашей колоде!")
+                    return
+            
+            if not all_support:
+                bot.reply_to(message, 
+                    "❌ <b>Ошибка!</b>\n\n"
+                    "Можно отправлять более 1 карты только если ВСЕ карты имеют <b>'поддержка'</b> в конце названия!\n\n"
+                    "Пример правильного названия: <code>Лечение поддержка</code>", 
+                    parse_mode="HTML")
+                return
+        
+        # Парсим способности (теперь это текст, может содержать буквы)
         ability_details = []
         if abilities_str:
             ability_details = [x.strip() for x in abilities_str.split(',')]
         
+        # Получаем карты из колоды игрока
         user_cards = get_user_cards(user_id)
         
+        # Пятница - используем карты соперника
         if is_friday():
             opponent_id = game['p2'] if is_p1 else game['p1']
             if opponent_id:
                 user_cards = get_user_cards(opponent_id)
         
+        # Создаем список карт с данными
         cards_data = []
         for idx, card_num in enumerate(card_nums):
+            # Ищем карту по ID
             card_found = None
             for cid, c_file_id, c_name in user_cards:
                 if cid == card_num:
@@ -961,14 +1347,17 @@ def handle_card_submission(message):
                 bot.reply_to(message, f"❌ Карта #{card_num} не найдена в вашей колоде!")
                 return
             
+            # Получаем способность и детали
             ability_text = ability_details[idx] if idx < len(ability_details) else "0"
             
+            # Извлекаем первую цифру как номер способности (0-3)
             ability_num = 0
             details_text = ""
             
             for char in ability_text:
                 if char.isdigit() and int(char) in [0, 1, 2, 3]:
                     ability_num = int(char)
+                    # Всё что после первой цифры - детали
                     details_idx = ability_text.index(char) + 1
                     details_text = ability_text[details_idx:].strip()
                     break
@@ -979,50 +1368,30 @@ def handle_card_submission(message):
                 'details': details_text,
                 'card_name': card_found[2],
                 'card_id': card_found[0],
-                'is_support': "поддержка" in card_found[2].lower()
+                'is_support': card_found[2].lower().endswith('поддержка')
             })
         
-        # Сохраняем карты (можно перезаписать если соперник ещё не отправил)
+        # Сохраняем карты
         if is_p1:
             game['cards']['p1'] = cards_data
             game['cards_submitted_p1'] = True
-            
-            if game['cards_submitted_p2']:
-                # Оба отправили - начинаем раунд
-                bot.reply_to(message, 
-                    f"✅ Карты приняты!\n"
-                    f"🃏 Карт: {len(cards_data)}\n\n"
-                    f"⚔️ Оба игрока готовы! Раунд начинается...", 
-                    parse_mode="HTML")
-                check_round_complete(found_chat, game)
-            else:
-                # Ждем соперника
-                bot.reply_to(message, 
-                    f"✅ Карты приняты!\n"
-                    f"🃏 Карт: {len(cards_data)}\n\n"
-                    f"⏳ Ждем соперника...\n"
-                    f"💡 Можно изменить карты, пока соперник не отправил свои!", 
-                    parse_mode="HTML")
+            bot.reply_to(message, 
+                f"✅ Карты приняты!\n"
+                f"🃏 Карт: {len(cards_data)}\n"
+                f"⚡ Способности: {ability_details}\n\n"
+                f"Ждем соперника...", 
+                parse_mode="HTML")
         else:
             game['cards']['p2'] = cards_data
             game['cards_submitted_p2'] = True
-            
-            if game['cards_submitted_p1']:
-                # Оба отправили - начинаем раунд
-                bot.reply_to(message, 
-                    f"✅ Карты приняты!\n"
-                    f"🃏 Карт: {len(cards_data)}\n\n"
-                    f"⚔️ Оба игрока готовы! Раунд начинается...", 
-                    parse_mode="HTML")
-                check_round_complete(found_chat, game)
-            else:
-                # Ждем соперника
-                bot.reply_to(message, 
-                    f"✅ Карты приняты!\n"
-                    f"🃏 Карт: {len(cards_data)}\n\n"
-                    f"⏳ Ждем соперника...\n"
-                    f"💡 Можно изменить карты, пока соперник не отправил свои!", 
-                    parse_mode="HTML")
+            bot.reply_to(message, 
+                f"✅ Карты приняты!\n"
+                f"🃏 Карт: {len(cards_data)}\n"
+                f"⚡ Способности: {ability_details}\n\n"
+                f"Ждем соперника...", 
+                parse_mode="HTML")
+        
+        check_round_complete(found_chat, game)
         
     except (ValueError, IndexError) as e:
         bot.reply_to(message, 
@@ -1035,11 +1404,13 @@ def check_round_complete(chat_id, game):
         reveal_cards(chat_id, game)
 
 def reveal_cards(chat_id, game):
+    """Показывает все карты с фото из колоды"""
     p1_cards = game['cards']['p1']
     p2_cards = game['cards']['p2']
     
     media_group = []
     
+    # Карты Игрока 1
     for card in p1_cards:
         caption = f"{escape_html(game['nickname_p1'])}\n"
         caption += f"🃏 {escape_html(card['card_name'])}\n"
@@ -1048,6 +1419,7 @@ def reveal_cards(chat_id, game):
             caption += f"\n📝 {escape_html(card['details'])}"
         media_group.append(types.InputMediaPhoto(media=card['file_id'], caption=caption))
     
+    # Карты Игрока 2
     for card in p2_cards:
         caption = f"{escape_html(game['nickname_p2'])}\n"
         caption += f"🃏 {escape_html(card['card_name'])}\n"
@@ -1056,11 +1428,13 @@ def reveal_cards(chat_id, game):
             caption += f"\n📝 {escape_html(card['details'])}"
         media_group.append(types.InputMediaPhoto(media=card['file_id'], caption=caption))
     
+    # Отправляем медиа-группу (максимум 10 фото)
     if media_group:
         for i in range(0, len(media_group), 10):
             chunk = media_group[i:i+10]
             bot.send_media_group(chat_id, chunk)
     
+    # Текстовое резюме с названиями карт, способностями и деталями
     p1_cards_summary = []
     for card in p1_cards:
         if card['details']:
@@ -1168,7 +1542,8 @@ def handle_draw(call):
     
     game['draw_consent'] = {
         'p1': False,
-        'p2': False
+        'p2': False,
+        'host': True
     }
     
     markup = types.InlineKeyboardMarkup()
@@ -1177,7 +1552,7 @@ def handle_draw(call):
     
     bot.send_message(chat_id, 
         f"⚖️ <b>Ведущий предложил ничью!</b>\n\n"
-        f"⚠️ Для ничьи нужно согласие ОБЕИХ игроков!\n\n"
+        f"Для ничьи нужно согласие ВСЕХ участников (ведущего и обоих игроков)\n\n"
         f"Игроки, проголосуйте:", 
         reply_markup=markup, parse_mode="HTML")
 
@@ -1191,45 +1566,36 @@ def handle_draw_vote(call):
     user_id = call.from_user.id
     
     if user_id not in [game['p1'], game['p2']]:
-        bot.answer_callback_query(call.id, "Только игроки могут голосовать!", show_alert=True)
+        bot.answer_callback_query(call.id, "Только игроки!", show_alert=True)
         return
     
     if 'draw_consent' not in game:
-        bot.answer_callback_query(call.id, "Голосование не активно!", show_alert=True)
         return
     
     if call.data == "agree_draw":
         if user_id == game['p1']:
-            if game['draw_consent']['p1']:
-                bot.answer_callback_query(call.id, "Вы уже согласились!", show_alert=True)
-                return
             game['draw_consent']['p1'] = True
-            bot.answer_callback_query(call.id, "Вы согласились на ничью")
-        elif user_id == game['p2']:
-            if game['draw_consent']['p2']:
-                bot.answer_callback_query(call.id, "Вы уже согласились!", show_alert=True)
-                return
+        else:
             game['draw_consent']['p2'] = True
-            bot.answer_callback_query(call.id, "Вы согласились на ничью")
+        bot.answer_callback_query(call.id, "Вы согласились на ничью")
     else:
         bot.answer_callback_query(call.id, "Вы отказались от ничьи")
-        bot.send_message(chat_id, f"❌ {escape_html(game['nickname_p1'] if user_id == game['p1'] else game['nickname_p2'])} отказался от ничьи. Игра продолжается.")
-        game['draw_consent'] = {}
+        bot.send_message(chat_id, "❌ Ничья отклонена. Игра продолжается.")
+        game['draw_consent'] = None
         show_battle_buttons(chat_id, game)
         return
     
-    if game['draw_consent'].get('p1', False) and game['draw_consent'].get('p2', False):
-        bot.send_message(chat_id, "✅ Оба игрока согласились на ничью!")
+    if all(game['draw_consent'].values()):
+        bot.send_message(chat_id, "✅ Все согласились на ничью!")
         finish_game_draw(chat_id, game)
     else:
-        p1_status = "✅" if game['draw_consent'].get('p1', False) else "⏳"
-        p2_status = "✅" if game['draw_consent'].get('p2', False) else "⏳"
+        p1_status = "✅" if game['draw_consent']['p1'] else "⏳"
+        p2_status = "✅" if game['draw_consent']['p2'] else "⏳"
         bot.send_message(chat_id, 
             f"🗳️ Голосование за ничью:\n\n"
             f"{p1_status} {escape_html(game['nickname_p1'])}\n"
-            f"{p2_status} {escape_html(game['nickname_p2'])}\n\n"
-            f"⚠️ Ждем согласия обоих игроков!", 
-            parse_mode="HTML")
+            f"{p2_status} {escape_html(game['nickname_p2'])}\n"
+            f"✅ {escape_html(game['host_nickname'])} (Ведущий)")
 
 def finish_game(chat_id, game):
     winner_nick = game['nickname_p1'] if game['score_p1'] >= 3 else game['nickname_p2']
@@ -1244,8 +1610,8 @@ def finish_game(chat_id, game):
     else:
         w_coins, l_coins = 2, 1
     
-    w_total, w_rem = update_user_stats(winner_id, w_coins, True)
-    l_total, l_rem = update_user_stats(loser_id, l_coins, True)
+    w_total, w_rem = update_user_stats(winner_id, w_coins, True, loser_id, won=True)
+    l_total, l_rem = update_user_stats(loser_id, l_coins, True, winner_id, won=False)
     
     today = datetime.date.today()
     limit = 14 if today.weekday() == 5 else 7
@@ -1267,8 +1633,8 @@ def finish_game(chat_id, game):
     del active_games[chat_id]
 
 def finish_game_draw(chat_id, game):
-    p1_total, p1_rem = update_user_stats(game['p1'], 1, True)
-    p2_total, p2_rem = update_user_stats(game['p2'], 1, True)
+    p1_total, p1_rem = update_user_stats(game['p1'], 1, True, game['p2'], draw=True)
+    p2_total, p2_rem = update_user_stats(game['p2'], 1, True, game['p1'], draw=True)
     
     today = datetime.date.today()
     limit = 14 if today.weekday() == 5 else 7
@@ -1287,6 +1653,63 @@ def finish_game_draw(chat_id, game):
     
     bot.send_message(chat_id, text, parse_mode="HTML")
     del active_games[chat_id]
+
+@bot.callback_query_handler(func=lambda call: call.data in ["accept_duel", "decline_duel"])
+def handle_duel_response(call):
+    chat_id = call.message.chat.id
+    
+    if chat_id not in player_challenges:
+        bot.answer_callback_query(call.id, "Вызов уже не активен!", show_alert=True)
+        return
+    
+    challenge = player_challenges[chat_id]
+    
+    if call.from_user.id != challenge['target']:
+        bot.answer_callback_query(call.id, "Только вызванный может ответить!", show_alert=True)
+        return
+    
+    if call.data == "accept_duel":
+        bot.answer_callback_query(call.id, "Вызов принят!")
+        bot.send_message(chat_id, f"✅ {escape_html(challenge['target_nick'])} принял вызов!")
+        
+        del player_challenges[chat_id]
+        create_game_from_duel(chat_id, challenge['challenger'], challenge['target'])
+    else:
+        bot.answer_callback_query(call.id, "Вызов отклонён")
+        bot.send_message(chat_id, f"❌ {escape_html(challenge['target_nick'])} отклонил вызов")
+        del player_challenges[chat_id]
+
+def create_game_from_duel(chat_id, p1_id, p2_id):
+    user_id = p1_id
+    
+    active_games[chat_id] = {
+        'host': user_id,
+        'host_nickname': get_user(user_id)[2] or f"Игрок {get_short_id(user_id)}",
+        'p1': p1_id,
+        'nickname_p1': get_user(p1_id)[2] or f"Игрок {get_short_id(p1_id)}",
+        'p2': p2_id,
+        'nickname_p2': get_user(p2_id)[2] or f"Игрок {get_short_id(p2_id)}",
+        'score_p1': 0,
+        'score_p2': 0,
+        'round': 1,
+        'cards': {},
+        'cards_submitted_p1': False,
+        'cards_submitted_p2': False,
+        'location': None,
+        'location_name': None
+    }
+    
+    game = active_games[chat_id]
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🎲 Случайная", callback_data="loc_random"))
+    markup.add(types.InlineKeyboardButton("🚫 Без локации", callback_data="loc_none"))
+    
+    bot.send_message(chat_id, 
+        f"🎮 <b>Дуэль началась!</b>\n"
+        f"👥 {escape_html(game['nickname_p1'])} vs {escape_html(game['nickname_p2'])}\n\n"
+        f"Ведущий, выберите локацию:", 
+        reply_markup=markup, parse_mode="HTML")
 # --- БОЙ С БОССОМ ---
 
 @bot.message_handler(commands=['boss_battle'])
@@ -1361,6 +1784,7 @@ def set_boss_time(message):
 
 @bot.message_handler(commands=['boss_reward'])
 def boss_reward(message):
+    """Награда от организатора"""
     global ORGANIZER_ID
     user_id = message.from_user.id
     
@@ -1387,25 +1811,9 @@ def boss_reward(message):
 
 # --- СКРЫТЫЕ АДМИН-КОМАНДЫ ---
 
-@bot.message_handler(commands=['dev_commands'])
-def dev_commands(message):
-    username = message.from_user.username
-    if username not in ['angel_zam', ORGANIZER_USERNAME]:
-        return
-    
-    text = (f"🛠️ <b>DEV COMMANDS</b>\n\n"
-            f"/test_mode — Вкл/Выкл режим теста\n"
-            f"/upload_location | Name | Desc — Загрузить локацию\n"
-            f"/schedule_message YYYY-MM-DD HH:MM notify|no_notify text\n"
-            f"/boss_reward <user_id> <coins> — Награда от босса\n"
-            f"/boss_time <h> <m> — Время боя с боссом\n"
-            f"/stats_user <id> — Статистика игрока\n"
-            f"/notifications — Настройка уведомлений")
-    
-    bot.reply_to(message, text, parse_mode="HTML")
-
 @bot.message_handler(commands=['test_mode'])
 def test_mode(message):
+    """Режим тестирования"""
     username = message.from_user.username
     if username not in ['angel_zam', ORGANIZER_USERNAME]:
         bot.reply_to(message, "Доступ запрещён")
@@ -1421,6 +1829,7 @@ def test_mode(message):
 
 @bot.message_handler(commands=['upload_location'])
 def upload_location(message):
+    """Загрузить локацию (только организатор)"""
     global ORGANIZER_ID
     user_id = message.from_user.id
     
@@ -1453,6 +1862,7 @@ def upload_location(message):
 
 @bot.message_handler(commands=['schedule_message'])
 def schedule_message_cmd(message):
+    """Запланировать сообщение"""
     global ORGANIZER_ID
     user_id = message.from_user.id
     
@@ -1507,46 +1917,124 @@ def schedule_message_cmd(message):
         
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
+
+@bot.message_handler(commands=['dev_commands'])
+def dev_commands(message):
+    """Показывает все команды разработчика"""
+    username = message.from_user.username
+    if username not in ['angel_zam', ORGANIZER_USERNAME]:
+        return
+    
+    text = (f"🛠️ <b>DEV COMMANDS</b>\n\n"
+            f"/test_mode — Вкл/Выкл режим теста\n"
+            f"/upload_location | Name | Desc — Загрузить локацию\n"
+            f"/schedule_message YYYY-MM-DD HH:MM notify|no_notify text\n"
+            f"/boss_reward <user_id> <coins> — Награда от босса\n"
+            f"/boss_time <h> <m> — Время боя с боссом\n"
+            f"/stats_user <id> — Статистика игрока\n"
+            f"/notifications — Настройка уведомлений")
+    
+    bot.reply_to(message, text, parse_mode="HTML")
+
+@bot.message_handler(commands=['add_coins'])
+def add_coins(message):
+    """Добавить монеты игроку (тест)"""
+    username = message.from_user.username
+    if username not in ['angel_zam', ORGANIZER_USERNAME]:
+        bot.reply_to(message, "Доступ запрещён")
+        return
+    
+    try:
+        target_id = int(message.text.split()[1])
+        coins = int(message.text.split()[2])
+        
+        user = get_user(target_id)
+        new_coins = user[3] + coins
+        update_user(target_id, coins=new_coins)
+        
+        bot.reply_to(message, f"✅ Добавлено {coins} монет игроку {target_id}\nНовый баланс: {new_coins}")
+    except:
+        bot.reply_to(message, "Использование: /add_coins <user_id> <монеты>")
+
+@bot.message_handler(commands=['reset_battles'])
+def reset_battles(message):
+    """Сбросить счётчик боёв (тест)"""
+    username = message.from_user.username
+    if username not in ['angel_zam', ORGANIZER_USERNAME]:
+        bot.reply_to(message, "Доступ запрещён")
+        return
+    
+    try:
+        target_id = int(message.text.split()[1])
+        update_user(target_id, battles_today=0, last_play_date="")
+        bot.reply_to(message, f"✅ Счётчик боёв сброшен для игрока {target_id}")
+    except:
+        bot.reply_to(message, "Использование: /reset_battles <user_id>")
 # --- ЕЖЕДНЕВНЫЕ СОБЫТИЯ ---
 
 def setup_daily_events():
+    """Настройка ежедневных событий по дням недели"""
+    
     events = {
         'mon': "📅 <b>ПОНЕДЕЛЬНИК!</b>\n\nКомандные бои! Возможность проводить бои 2 на 2!!!",
         'tue': "📅 <b>ВТОРНИК!</b>\n\nТурнир в колизее! Победитель получит новую карту!",
-        'wed': "📅 <b>СРЕДА!</b>\n\nОткрытие магазина!",
+        'wed': "📅 <b>СРЕДА!</b>\n\nОткрытие магазина! Покупка не случайных, а известных карт которые есть в наличии!",
         'thu': "📅 <b>ЧЕТВЕРГ!</b>\n\nРозыгрыш карты! Случайный игрок получает Серую карту!",
-        'fri': "📅 <b>ПЯТНИЦА!</b>\n\nСмена сил! Используйте карты соперников!",
-        'sat': "📅 <b>СУББОТА!</b>\n\nБезграничные бои! Лимит увеличен до 14!",
-        'sun': "📅 <b>ВОСКРЕСЕНЬЕ!</b>\n\nБОСС НЕДЕЛИ! Все против босса!"
+        'fri': "📅 <b>ПЯТНИЦА!</b>\n\nСмена сил! В этот день каждый из соперников использует набор карт своего противника!",
+        'sat': "📅 <b>СУББОТА!</b>\n\nБезграничные бои! Количество оплачиваемых боев увеличивается до 14!!!",
+        'sun': "📅 <b>ВОСКРЕСЕНЬЕ!</b>\n\nБОСС НЕДЕЛИ! Все участники объединяются и сражаются против босса недели ради Уникальных карт!"
     }
     
     for day, text in events.items():
         scheduler.add_job(
-            lambda t=text: None,
+            lambda t=text: None,  # Заглушка, реально отправлять нужно в активные чаты
             CronTrigger(day_of_week=day, hour=0, minute=0),
             id=f'{day}_event'
         )
 
+# --- ОБРАБОТКА ОШИБОК ---
+
+@bot.message_handler(func=lambda message: True)
+def handle_all_messages(message):
+    """Обрабатывает все сообщения (для отладки)"""
+    # Можно добавить логирование здесь
+    pass
+
+
+
 # --- ЗАПУСК ---
 
 if __name__ == '__main__':
+    # Инициализация базы данных
     init_db()
+    
+    # Настройка ежедневных событий
     setup_daily_events()
+    
+    # Настройка команд меню
     setup_bot_commands()
     
     print("=" * 50)
-    print("БОТ ЗАПУЩЕН!")
+    print("🤖 БОТ ЗАПУЩЕН!")
     print("=" * 50)
-    print(f"Организатор: @{ORGANIZER_USERNAME}")
-    print(f"Тестировщик: @{TEST_MODE_USER}")
+    print(f"📛 Организатор: @{ORGANIZER_USERNAME}")
+    print(f"🧪 Тестировщик: @{TEST_MODE_USER}")
     print("=" * 50)
-    print("ВАЖНО: Попросите @Kitenokowo13 написать /start")
-    print("для регистрации как организатор!")
+    print("⚠️ ВАЖНО: Попросите @Kitenokowo13 написать /start")
+    print("   для автоматической регистрации как организатор!")
     print("=" * 50)
-    print("Бот готов к работе...")
+    print("✅ Бот готов к работе...")
+    print("=" * 50)
+    print("📋 Команды в группе: /duel, /list, /r, /s, /locations")
+    print("📋 Команды в ЛС: /start, /name, /add, /my_cards, /delete, /surrender, /stats, /get_id")
+    print("=" * 50)
     
     try:
         bot.infinity_polling()
     except KeyboardInterrupt:
-        print("\nБот остановлен")
+        print("\n🛑 Бот остановлен пользователем")
         scheduler.shutdown()
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка: {e}")
+        scheduler.shutdown()
+
